@@ -1,0 +1,93 @@
+name: Update Goldfish Manifest
+
+on:
+  schedule:
+    # 每天 00:00 UTC（北京时间 08:00）运行一次
+    - cron: '0 0 * * *'
+  workflow_dispatch:
+
+jobs:
+  update-manifest:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Determine latest upstream version
+        id: check
+        run: |
+          VERSION=$(curl -sL https://api.github.com/repos/MoganLab/goldfish/releases/latest | jq -r '.tag_name // "" | ltrimstr("v")')
+          if [ -z "$VERSION" ] || [ "$VERSION" = "null" ]; then
+            echo "无法获取上游最新版本，退出"
+            exit 1
+          fi
+
+          CURRENT_VERSION=$(jq -r '.version' bucket/goldfish.json)
+
+          echo "upstream=$VERSION current=$CURRENT_VERSION"
+          echo "new_version=$VERSION" >> "$GITHUB_OUTPUT"
+
+          if [ "$VERSION" != "$CURRENT_VERSION" ]; then
+            echo "update_available=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "update_available=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Verify Windows x64 binary asset exists
+        id: asset
+        if: steps.check.outputs.update_available == 'true'
+        run: |
+          VERSION="${{ steps.check.outputs.new_version }}"
+          ASSET="goldfish-scheme-x64-v${VERSION}-win.zip"
+          STATUS=$(curl -sIL --max-time 15 -o /dev/null -w "%{http_code}" \
+            "https://github.com/MoganLab/goldfish/releases/download/v${VERSION}/${ASSET}")
+          echo "asset http status: $STATUS"
+          if [ "$STATUS" != "200" ]; then
+            echo "::warning::上游 v${VERSION} 还没有 Windows x64 二进制资产（${ASSET}，HTTP ${STATUS}），跳过本次更新"
+            echo "binary_ready=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "binary_ready=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Download asset and calculate sha256
+        id: sha
+        if: steps.asset.outputs.binary_ready == 'true'
+        run: |
+          VERSION="${{ steps.check.outputs.new_version }}"
+          ASSET="goldfish-scheme-x64-v${VERSION}-win.zip"
+          curl -fsSL "https://github.com/MoganLab/goldfish/releases/download/v${VERSION}/${ASSET}" \
+            -o /tmp/gf-win.zip
+          SHA256=$(sha256sum /tmp/gf-win.zip | awk '{print $1}')
+          echo "sha256=$SHA256" >> "$GITHUB_OUTPUT"
+
+      - name: Update manifest
+        if: steps.asset.outputs.binary_ready == 'true'
+        run: |
+          VERSION="${{ steps.check.outputs.new_version }}"
+          SHA256="${{ steps.sha.outputs.sha256 }}"
+          NEW_URL="https://github.com/MoganLab/goldfish/releases/download/v${VERSION}/goldfish-scheme-x64-v${VERSION}-win.zip"
+
+          jq --indent 4 \
+            --arg ver "$VERSION" \
+            --arg url "$NEW_URL" \
+            --arg hash "$SHA256" \
+            '.version = $ver | .architecture."64bit".url = $url | .architecture."64bit".hash = $hash' \
+            bucket/goldfish.json > /tmp/goldfish.json && mv /tmp/goldfish.json bucket/goldfish.json
+
+          echo "=== 更新后的 goldfish.json ==="
+          cat bucket/goldfish.json
+
+      - name: Commit and push
+        if: steps.asset.outputs.binary_ready == 'true'
+        run: |
+          git config --local user.email "github-actions[bot]@users.noreply.github.com"
+          git config --local user.name "github-actions[bot]"
+          git remote set-url origin https://x-access-token:${{ secrets.GITHUB_TOKEN }}@github.com/${{ github.repository }}.git
+          git add bucket/goldfish.json
+          git commit -m "chore: update goldfish to v${{ steps.check.outputs.new_version }}"
+          git pull --rebase origin "${{ github.ref_name }}"
+          git push
